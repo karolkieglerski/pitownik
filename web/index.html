@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pitownik — Kalkulator PIT-38</title>
+
+  <!-- SEO & sharing -->
+  <meta name="description" content="pitownik — kalkulator PIT-38 dla polskich inwestorów: E*TRADE (RSU, ESPP) i XTB. Oblicza podatek z uwzględnieniem kursów NBP.">
+  <meta name="keywords" content="PIT-38, RSU, ESPP, E*TRADE, XTB, podatek, kalkulator, NBP, kurs USD PLN, pitownik">
+  <meta name="author" content="Karol Kieglerski">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="pitownik — Kalkulator PIT-38">
+  <meta property="og:description" content="Kalkulator PIT-38 dla polskich inwestorów z E*TRADE (RSU/ESPP) i XTB. Automatyczne pobieranie kursów NBP.">
+  <meta property="og:site_name" content="pitownik">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="pitownik — Kalkulator PIT-38">
+  <meta name="twitter:description" content="Kalkulator PIT-38 dla polskich inwestorów: E*TRADE i XTB. Kursy NBP automatycznie.">
+
+  <!-- Favicon (inline SVG) -->
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+
+    <header>
+      <h1>pitownik</h1>
+      <p class="subtitle">Kalkulator PIT-38 na podstawie danych z E*TRADE i XTB</p>
+    </header>
+
+    <main>
+
+      <!-- Upload -->
+      <section id="uploadSection">
+        <div class="upload-zone" id="uploadZone">
+          <div class="upload-icon">📂</div>
+          <p class="upload-title">Przeciągnij i upuść plik <strong>.xlsx</strong></p>
+          <p class="upload-or">lub</p>
+          <label for="fileInput" class="btn-upload">Wybierz plik z dysku</label>
+          <input type="file" id="fileInput" accept=".xlsx" hidden>
+          <p class="upload-hint">Plik <em>Gains &amp; Losses</em> z E*TRADE albo raport z XTB — typ pliku wykrywany automatycznie</p>
+        </div>
+      </section>
+
+      <!-- Loading -->
+      <section id="loadingSection" class="hidden">
+        <div class="loading-card">
+          <div class="spinner"></div>
+          <p id="loadingText" class="loading-text">Wczytywanie pliku...</p>
+          <div class="nbp-log" id="nbpLog"></div>
+        </div>
+      </section>
+
+      <!-- Error -->
+      <section id="errorSection" class="hidden">
+        <div class="error-card">
+          <div class="error-icon">⚠️</div>
+          <div class="error-message" id="errorBox"></div>
+        </div>
+        <div class="action-bar">
+          <button class="btn-reset" onclick="resetApp()">← Wczytaj inny plik</button>
+        </div>
+      </section>
+
+      <!-- Results -->
+      <section id="resultsSection" class="hidden">
+        <div class="results-bar">
+          <span class="results-filename" id="resultsFilename"></span>
+          <button class="btn-reset" onclick="resetApp()">← Wczytaj inny plik</button>
+        </div>
+        <div id="results"></div>
+      </section>
+
+    </main>
+
+    <footer>
+      <p class="disclaimer">
+        ⚠️ Program ma charakter wyłącznie informacyjny i pomocniczy.
+        Autorzy nie ponoszą odpowiedzialności za błędy w obliczeniach ani
+        za konsekwencje wynikające z użycia programu w deklaracjach podatkowych.
+        Przed złożeniem PIT-38 zweryfikuj obliczenia z doradcą podatkowym.
+      </p>
+      <p class="footer-links">MIT License &nbsp;·&nbsp; Open Source</p>
+    </footer>
+
+  </div>
+
+  <!-- SheetJS for XLSX parsing (vendored locally) -->
+  <script src="vendor/xlsx.full.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
