@@ -394,20 +394,121 @@ async function getNbpRate(isoDate, currency = 'usd') {
 /**
  * Fetch NBP rates for an array of ISO date strings.
  * Deduplicates and sorts dates; calls onProgress(iso, {rate, effectiveDate})
- * after each successful fetch. Currency defaults to USD.
+ * after each successful lookup. Currency defaults to USD.
+ *
+ * Uses NBP *range* queries — one request per ~year of data instead of one
+ * request per date. Rapid single-date requests are throttled by NBP and
+ * fail with connection errors ("Load failed") on files with many dates.
  * Returns a Map of ISO date string → { rate, effectiveDate }.
  */
 async function fetchNbpRates(isoDateArray, onProgress, currency = 'usd') {
   const unique = [...new Set(isoDateArray.filter(Boolean))].sort();
   const ratesMap = new Map();
+  if (unique.length === 0) return ratesMap;
+
+  const code = String(currency).toLowerCase();
+  const available = await fetchNbpRateRange(
+    code,
+    subtractDays(unique[0], 7),
+    unique[unique.length - 1],
+  );
 
   for (const iso of unique) {
-    const result = await getNbpRate(iso, currency);
+    const entry = findPrevBusinessRate(available, iso);
+    if (!entry) {
+      throw new Error(
+        `Nie udało się pobrać kursu NBP dla daty ${iso} (sprawdzono 7 dni wstecz)`,
+      );
+    }
+    const result = { rate: entry.mid, effectiveDate: entry.effectiveDate };
     ratesMap.set(iso, result);
     if (onProgress) onProgress(iso, result);
   }
 
   return ratesMap;
+}
+
+/**
+ * Last NBP rate strictly before isoDate, looking back at most 7 days
+ * (the same window as the single-date getNbpRate() fallback).
+ * `ratesAsc` is an ascending array of { effectiveDate, mid }.
+ */
+function findPrevBusinessRate(ratesAsc, isoDate) {
+  const limit = subtractDays(isoDate, 7);
+  let found = null;
+  for (const r of ratesAsc) {
+    if (r.effectiveDate < isoDate && r.effectiveDate >= limit) found = r;
+  }
+  return found;
+}
+
+/**
+ * Fetch NBP table A rates for [fromIso, toIso] using range queries
+ * (max 367 days per request; consecutive chunks overlap so that the
+ * 7-day "previous business day" window stays covered). The end date is
+ * clamped to today — NBP rejects future ranges with an error.
+ * Returns an ascending array of { effectiveDate, mid }.
+ */
+async function fetchNbpRateRange(currencyCode, fromIso, toIso) {
+  const today = new Date().toISOString().slice(0, 10);
+  const end = toIso > today ? today : toIso;
+
+  const CHUNK = 365;  // NBP allows up to 367 days per range query
+  const OVERLAP = 7;  // keeps the 7-day lookup window covered across chunks
+
+  const out = [];
+  let chunkStart = fromIso;
+  while (chunkStart <= end) {
+    let chunkEnd = subtractDays(chunkStart, -CHUNK);
+    if (chunkEnd > end) chunkEnd = end;
+
+    for (const r of await fetchNbpChunk(currencyCode, chunkStart, chunkEnd)) {
+      if (!out.some(x => x.effectiveDate === r.effectiveDate)) out.push(r);
+    }
+
+    if (chunkEnd === end) break;
+    chunkStart = subtractDays(chunkEnd, OVERLAP - 1);
+  }
+
+  out.sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate));
+  return out;
+}
+
+/**
+ * One NBP range request with retries on transient network errors and
+ * rate limiting. A 404 means "no quotes in this range" (e.g. weekends
+ * only) and yields an empty list.
+ */
+async function fetchNbpChunk(currencyCode, fromIso, toIso) {
+  const url =
+    `https://api.nbp.pl/api/exchangerates/rates/a/${currencyCode}` +
+    `/${fromIso}/${toIso}/?format=json`;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(url);
+    } catch (err) {
+      if (attempt < 3) {
+        await new Promise(r => setTimeout(r, 400 * attempt));
+        continue;
+      }
+      throw new Error(`Błąd połączenia z NBP API: ${err.message}`);
+    }
+
+    if (resp.ok) {
+      const data = await resp.json();
+      return data.rates ?? [];
+    }
+    if (resp.status === 404) return [];
+    if ((resp.status === 429 || resp.status >= 500) && attempt < 3) {
+      await new Promise(r => setTimeout(r, 400 * attempt));
+      continue;
+    }
+    throw new Error(
+      `NBP API zwróciło błąd ${resp.status} dla zakresu ${fromIso}–${toIso}`);
+  }
+  return [];
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -46,7 +46,7 @@ const wrappedSource = `
     readTransactions, getNbpRate, fetchNbpRates, groupBySaleDate,
     renderResults,
     excelSerialToIso, xtbDateToIso, isXtbWorkbook, readXtbReport,
-    xtbGroupBySaleDate, xtbRate, xtbYearSummaries,
+    xtbGroupBySaleDate, xtbRate, xtbYearSummaries, findPrevBusinessRate,
   });
 `;
 eval(wrappedSource);
@@ -55,7 +55,7 @@ const {
   WIRE_FEE_USD, esc, fmt, parseDateToIso, formatDate, subtractDays,
   readTransactions, getNbpRate, fetchNbpRates, groupBySaleDate,
   excelSerialToIso, xtbDateToIso, isXtbWorkbook, readXtbReport,
-  xtbGroupBySaleDate, xtbRate, xtbYearSummaries,
+  xtbGroupBySaleDate, xtbRate, xtbYearSummaries, findPrevBusinessRate,
 } = moduleScope;
 
 // ─── Load example XLSX ───────────────────────────────────────────────────
@@ -379,6 +379,148 @@ describe('NBP rates', () => {
     const rates = await fetchNbpRates(dates);
     assert.equal(callCount, 1);
     assert.ok(rates.has('2025-04-10'));
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// fetchNbpRates — batched range queries (NBP throttles rapid single requests)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('fetchNbpRates (batched range queries)', () => {
+  beforeEach(() => {
+    mock.restoreAll();
+  });
+
+  const mockRange = (rates) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ rates }),
+  });
+
+  it('fetches many dates with a single request', async () => {
+    const mockRates = [
+      { effectiveDate: '2025-04-04', mid: 3.8 },
+      { effectiveDate: '2025-04-07', mid: 3.9 },
+      { effectiveDate: '2025-04-09', mid: 4.0 },
+      { effectiveDate: '2025-04-10', mid: 4.05 },
+    ];
+    let callCount = 0;
+    mock.method(globalThis, 'fetch', async () => {
+      callCount++;
+      return mockRange(mockRates);
+    });
+
+    const dates = ['2025-04-11', '2025-04-10', '2025-04-10', '2025-04-07'];
+    const rates = await fetchNbpRates(dates);
+
+    assert.equal(callCount, 1);
+    assert.deepEqual([...rates.keys()], ['2025-04-07', '2025-04-10', '2025-04-11']);
+  });
+
+  it('uses the previous business day, skipping weekends', async () => {
+    const mockRates = [
+      { effectiveDate: '2025-04-04', mid: 3.8 },
+      { effectiveDate: '2025-04-07', mid: 3.9 },
+      { effectiveDate: '2025-04-09', mid: 4.0 },
+      { effectiveDate: '2025-04-10', mid: 4.05 },
+    ];
+    mock.method(globalThis, 'fetch', async () => mockRange(mockRates));
+
+    const rates = await fetchNbpRates(['2025-04-07', '2025-04-10', '2025-04-11']);
+
+    // 05–06.04 to weekend → dla 07.04 kursem jest notowanie z 04.04
+    assert.equal(rates.get('2025-04-07').rate, 3.8);
+    assert.equal(rates.get('2025-04-07').effectiveDate, '2025-04-04');
+    // dla 10.04 — notowanie z 09.04 (nie własne)
+    assert.equal(rates.get('2025-04-10').rate, 4.0);
+    // dla 11.04 — notowanie z 10.04
+    assert.equal(rates.get('2025-04-11').rate, 4.05);
+    assert.equal(rates.get('2025-04-11').effectiveDate, '2025-04-10');
+  });
+
+  it('calls onProgress once per unique date', async () => {
+    mock.method(globalThis, 'fetch', async () =>
+      mockRange([{ effectiveDate: '2025-04-09', mid: 4.0 }]));
+
+    const seen = [];
+    await fetchNbpRates(
+      ['2025-04-10', '2025-04-11', '2025-04-10'],
+      iso => seen.push(iso),
+    );
+
+    assert.deepEqual(seen, ['2025-04-10', '2025-04-11']);
+  });
+
+  it('splits into chunks when dates span more than one request', async () => {
+    const mockRates = [
+      { effectiveDate: '2025-01-02', mid: 3.9 },
+      { effectiveDate: '2026-03-03', mid: 4.1 },
+    ];
+    let callCount = 0;
+    mock.method(globalThis, 'fetch', async () => {
+      callCount++;
+      return mockRange(mockRates);
+    });
+
+    const rates = await fetchNbpRates(['2025-01-05', '2026-03-04']);
+
+    assert.equal(callCount, 2);
+    assert.equal(rates.get('2025-01-05').rate, 3.9);
+    assert.equal(rates.get('2026-03-04').rate, 4.1);
+  });
+
+  it('builds a range URL with the lowercase currency code', async () => {
+    const urls = [];
+    mock.method(globalThis, 'fetch', async url => {
+      urls.push(String(url));
+      return mockRange([{ effectiveDate: '2025-04-09', mid: 4.0 }]);
+    });
+
+    await fetchNbpRates(['2025-04-10'], null, 'USD');
+
+    assert.equal(
+      urls[0],
+      'https://api.nbp.pl/api/exchangerates/rates/a/usd' +
+      '/2025-04-03/2025-04-10/?format=json',
+    );
+  });
+
+  it('throws the standard error when no quote is available', async () => {
+    mock.method(globalThis, 'fetch', async () => mockRange([]));
+
+    await assert.rejects(
+      () => fetchNbpRates(['2025-04-10']),
+      /Nie udało się pobrać kursu NBP/,
+    );
+  });
+});
+
+describe('findPrevBusinessRate', () => {
+  const asc = [
+    { effectiveDate: '2025-04-01', mid: 3.7 },
+    { effectiveDate: '2025-04-04', mid: 3.8 },
+  ];
+
+  it('returns the closest earlier quote', () => {
+    assert.equal(findPrevBusinessRate(asc, '2025-04-08').effectiveDate, '2025-04-04');
+    assert.equal(findPrevBusinessRate(asc, '2025-04-04').effectiveDate, '2025-04-01');
+  });
+
+  it('accepts a quote exactly 7 days back', () => {
+    const one = [{ effectiveDate: '2025-04-01', mid: 3.7 }];
+    assert.equal(findPrevBusinessRate(one, '2025-04-08').mid, 3.7);
+  });
+
+  it('rejects a quote 8+ days back', () => {
+    const one = [{ effectiveDate: '2025-04-01', mid: 3.7 }];
+    assert.equal(findPrevBusinessRate(one, '2025-04-09'), null);
+  });
+
+  it('never returns a quote from the same or later day', () => {
+    // 01.04 jest jedynym wcześniejszym notowaniem — dla samej daty 01.04 brak
+    assert.equal(findPrevBusinessRate(
+      [{ effectiveDate: '2025-04-01', mid: 3.7 }], '2025-04-01'), null);
   });
 });
 
