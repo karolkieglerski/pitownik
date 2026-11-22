@@ -1094,6 +1094,1018 @@ function renderXtbResults(report, rates) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Multi-broker support (IBKR, Trading 212, Revolut, eToro)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Parse an amount cell into a number. Tolerates currency prefixes
+ * ("EUR 104.64"), thousand separators ("1,234.56" / "1.234,56"),
+ * spaces and parenthesised negatives ("(123.45)").
+ */
+function parseAmount(val) {
+  if (val === null || val === undefined || val === '') return 0;
+  if (typeof val === 'number') return val;
+
+  let s = String(val).trim();
+  const paren = /^\(.*\)$/.test(s);
+  s = s.replace(/[\s\u00a0]/g, '');
+
+  const lastComma = s.lastIndexOf(',');
+  const lastDot = s.lastIndexOf('.');
+  if (lastComma !== -1 && lastDot !== -1) {
+    // Both separators present: the last one is the decimal separator.
+    if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');
+    else s = s.replace(/,/g, '');
+  } else if (lastComma !== -1) {
+    // Only commas: "1,234" is thousands, "12,34" is decimal.
+    s = /^-?\d{1,3}(,\d{3})+$/.test(s) ? s.replace(/,/g, '') : s.replace(',', '.');
+  }
+
+  s = s.replace(/[^\d.-]/g, '');
+  const n = parseFloat(s);
+  if (!Number.isFinite(n)) return 0;
+  return paren ? -Math.abs(n) : n;
+}
+
+/**
+ * Convert any date cell to an ISO "YYYY-MM-DD" string. Handles JS Date
+ * objects, Excel serials, ISO timestamps ("2025-01-06T09:02:14.772Z"),
+ * "YYYY-MM-DD, HH:MM:SS" (IBKR) and E*TRADE-style "MM/DD/YYYY".
+ */
+function parseDateAny(val) {
+  if (val === null || val === undefined || val === '') return null;
+  if (val instanceof Date) return val.toISOString().slice(0, 10);
+  if (typeof val === 'number') return excelSerialToIso(val);
+
+  const s = String(val).trim();
+  if (!s || s === '--') return null;
+
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return iso[0];
+  return parseDateToIso(val);
+}
+
+/**
+ * Like parseDateAny(), but keeps the time part when present and returns
+ * a sortable "YYYY-MM-DD HH:MM:SS" string (used to order same-day legs).
+ */
+function parseTimeAny(val) {
+  const iso = parseDateAny(val);
+  if (!iso) return null;
+  const m = String(val ?? '').match(/(\d{2}):(\d{2}):(\d{2})/);
+  return m ? `${iso} ${m[0]}` : iso;
+}
+
+/** Normalise a currency code; GBX (pence) becomes GBP. */
+function normCurrency(val) {
+  const s = String(val ?? '').trim().toUpperCase();
+  if (s === 'GBX') return 'GBP';
+  return /^[A-Z]{3}$/.test(s) ? s : 'USD';
+}
+
+// ─── FIFO matching of trade legs ─────────────────────────────
+
+/**
+ * Match trade legs into closed positions using FIFO per instrument.
+ * Each leg: { instrument, ticker, category, currency, iso, ts, qty
+ * (signed: +buy / -sell), value (abs gross amount in currency), fee }.
+ *
+ * Returns positions in the same model shape as the XTB report:
+ *   costValue / costIso    — purchase leg (koszt uzyskania),
+ *   revenueValue / saleIso — sale leg (przychód).
+ * Buy fees are added to the cost; sell fees are added to the cost of the
+ * matched position as well (koszty związane ze zbyciem). Legs left open
+ * at the end are ignored — they are not taxable events yet.
+ */
+function matchLegsFifo(legs) {
+  const byKey = new Map();
+  const sorted = [...legs].sort((a, b) =>
+    String(a.ts || a.iso).localeCompare(String(b.ts || b.iso)));
+  for (const leg of sorted) {
+    const key = `${leg.ticker || leg.instrument}|${leg.currency}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(leg);
+  }
+
+  const positions = [];
+  for (const key of byKey.keys()) {
+    positions.push(...matchInstrumentLegs(byKey.get(key)));
+  }
+  positions.sort((a, b) => a.saleIso.localeCompare(b.saleIso));
+  return positions;
+}
+
+function matchInstrumentLegs(legs) {
+  const positions = [];
+  const longLots = [];  // open buys:  { iso, qty, perShare, feePerShare }
+  const shortLots = []; // open shorts: { iso, qty, perShare, feePerShare }
+  const EPS = 1e-9;
+
+  for (const leg of legs) {
+    let qty = Math.abs(Number(leg.qty) || 0);
+    if (qty <= EPS) continue;
+    const perShare = leg.value / qty;
+    const feePerShare = (leg.fee || 0) / qty;
+    const base = {
+      instrument: leg.instrument, ticker: leg.ticker,
+      category: leg.category, currency: leg.currency,
+    };
+
+    if (leg.qty > 0) {
+      // Buy: close short lots first (FIFO), the rest becomes a long lot.
+      while (qty > EPS && shortLots.length) {
+        const lot = shortLots[0];
+        const take = Math.min(qty, lot.qty);
+        positions.push({
+          ...base,
+          type: 'SELL', // short position: the sale happened first
+          volume: take,
+          saleIso: lot.iso,
+          revenueValue: lot.perShare * take,
+          costIso: leg.iso,
+          costValue: perShare * take + feePerShare * take + lot.feePerShare * take,
+        });
+        lot.qty -= take;
+        qty -= take;
+        if (lot.qty <= EPS) shortLots.shift();
+      }
+      if (qty > EPS) longLots.push({ iso: leg.iso, qty, perShare, feePerShare });
+    } else {
+      // Sell: close long lots first (FIFO), the rest becomes a short lot.
+      while (qty > EPS && longLots.length) {
+        const lot = longLots[0];
+        const take = Math.min(qty, lot.qty);
+        positions.push({
+          ...base,
+          type: 'BUY', // long position: bought first, sold now
+          volume: take,
+          saleIso: leg.iso,
+          revenueValue: perShare * take,
+          costIso: lot.iso,
+          costValue: lot.perShare * take + lot.feePerShare * take + feePerShare * take,
+        });
+        lot.qty -= take;
+        qty -= take;
+        if (lot.qty <= EPS) longLots.shift();
+      }
+      if (qty > EPS) shortLots.push({ iso: leg.iso, qty, perShare, feePerShare });
+    }
+  }
+
+  for (const p of positions) p.profit = p.revenueValue - p.costValue;
+  return positions;
+}
+
+// ─── Interactive Brokers (Activity Statement, CSV) ───────────
+
+/** True if the rows look like an IBKR Activity Statement (sectioned CSV). */
+function isIbkrRows(rows) {
+  const sections = new Set(rows.map(r => String(r[0] ?? '').trim()));
+  return sections.has('Trades') &&
+    (sections.has('Statement') || sections.has('Account Information'));
+}
+
+/**
+ * Parse IBKR Activity Statement rows (first column = section name,
+ * second column = row type: Header/Data/SubTotal/Total). Reads the
+ * Trades section (Order/Trade rows; Closed Lot rows repeat fills at lot
+ * level and are skipped to avoid double counting) plus Dividends and
+ * Withholding Tax sections (informational only).
+ */
+function readIbkrRows(rows) {
+  const legs = [];
+  const dividendOps = [];
+  const dividendTaxOps = [];
+  let section = null;
+  let header = null;
+
+  for (const row of rows) {
+    const sec = String(row[0] ?? '').trim();
+    const rowType = String(row[1] ?? '').trim();
+    if (!sec && !rowType) continue;
+
+    if (rowType === 'Header') {
+      section = sec;
+      header = row.slice(2).map(h => String(h ?? '').trim());
+      continue;
+    }
+    if (rowType !== 'Data' || sec !== section || !header) continue;
+
+    const rec = {};
+    header.forEach((h, i) => { rec[h] = row[i + 2] ?? null; });
+
+    if (sec === 'Trades') {
+      const disc = String(rec['DataDiscriminator'] ?? '').toLowerCase();
+      if (disc.includes('closed') || disc === 'summary' || disc === 'lot') continue;
+
+      const category = String(rec['Asset Category'] ?? '').trim();
+      // Options/futures/forex use multipliers — out of scope.
+      if (category && !/^(stocks?|etfs?)$/i.test(category)) continue;
+
+      const ticker = String(rec['Symbol'] ?? '').trim();
+      const iso = parseDateAny(rec['Date/Time']);
+      const qty = parseAmount(rec['Quantity']);
+      const price = parseAmount(rec['T. Price']);
+      const fee = Math.abs(parseAmount(rec['Comm/Fee']));
+      const bs = String(rec['Buy/Sell'] ?? '').trim().toLowerCase();
+      const sign = bs ? (bs.startsWith('b') ? 1 : -1) : Math.sign(qty);
+      if (!iso || !sign) continue;
+
+      legs.push({
+        instrument: ticker,
+        ticker,
+        category: category || 'Akcje',
+        currency: normCurrency(rec['Currency'] ?? 'USD'),
+        iso,
+        ts: parseTimeAny(rec['Date/Time']),
+        qty: sign * Math.abs(qty),
+        value: Math.abs(qty) * price,
+        fee,
+      });
+    } else if (sec === 'Dividends' || sec === 'Withholding Tax') {
+      const iso = parseDateAny(rec['Date'] ?? rec['Pay Date'] ?? rec['Report Date']);
+      const currency = normCurrency(rec['Currency'] ?? 'USD');
+      const amount = Math.abs(parseAmount(rec['Amount']));
+      if (!iso || !amount) continue;
+      if (sec === 'Dividends') {
+        dividendOps.push({ iso, amount, currency });
+      } else {
+        dividendTaxOps.push({ iso, amount, currency });
+      }
+    }
+  }
+
+  return {
+    broker: 'IBKR',
+    positions: matchLegsFifo(legs),
+    dividendOps,
+    dividendTaxOps,
+    interestOps: [],
+  };
+}
+
+// ─── Trading 212 (History export, CSV) ───────────────────────
+
+/** True if the rows look like a Trading 212 history export. */
+function isT212Rows(rows) {
+  return rows.slice(0, 5).some(r =>
+    r.some(c => String(c ?? '').trim().toLowerCase() === 'action') &&
+    r.some(c => /price\s*\/\s*share/i.test(String(c ?? ''))));
+}
+
+/**
+ * Parse a Trading 212 history export (one row per event, "Action"
+ * column decides the row kind). Column sets vary between exports, so
+ * columns are located by name. GBX (pence) prices are converted to GBP.
+ */
+function readT212Rows(rows) {
+  const hIdx = rows.findIndex(r =>
+    r.some(c => String(c ?? '').trim().toLowerCase() === 'action'));
+  if (hIdx === -1) {
+    throw new Error('Nie znaleziono nagłówka eksportu Trading 212');
+  }
+
+  const headers = rows[hIdx].map(h => String(h ?? '').trim());
+  const col = (...names) =>
+    headers.findIndex(h => names.includes(h.toLowerCase()));
+  const colRe = (re) => headers.findIndex(h => re.test(h.toLowerCase()));
+
+  const cAction = col('action');
+  const cTime = col('time');
+  const cTicker = col('ticker');
+  const cName = col('name');
+  const cShares = col('no. of shares');
+  const cPrice = col('price / share');
+  const cPriceCur = colRe(/^currency\s*\(price/);
+  const cTotal = colRe(/^total/);
+  const cTotalCur = colRe(/^currency\s*\(total/);
+  const cWithhold = colRe(/withholding tax/);
+  const feeCols = headers
+    .map((h, i) => ({ h: h.toLowerCase(), i }))
+    .filter(x => /^(charge amount|transaction fee|finra fee|stamp duty)/.test(x.h));
+
+  const legs = [];
+  const dividendOps = [];
+  const dividendTaxOps = [];
+  const interestOps = [];
+
+  for (const row of rows.slice(hIdx + 1)) {
+    const action = String(row[cAction] ?? '').trim().toLowerCase();
+    if (!action) continue;
+
+    const iso = parseDateAny(row[cTime]);
+    const curRaw = String(row[cPriceCur] ?? row[cTotalCur] ?? 'USD').trim().toUpperCase();
+    const pence = curRaw === 'GBX';
+    const currency = normCurrency(curRaw);
+    const scale = pence ? 100 : 1;
+    const total = parseAmount(row[cTotal]) / scale;
+
+    if (/\bbuy\b|buy$/.test(action) && !/sell/.test(action)) {
+      const shares = parseAmount(row[cShares]);
+      if (!iso || !shares) continue;
+      const fee = feeCols.reduce(
+        (s, f) => s + Math.abs(parseAmount(row[f.i])) / scale, 0);
+      legs.push({
+        instrument: String(row[cName] ?? row[cTicker] ?? '').trim(),
+        ticker: String(row[cTicker] ?? '').trim(),
+        category: 'Akcje',
+        currency, iso, ts: parseTimeAny(row[cTime]),
+        qty: shares,
+        value: shares * parseAmount(row[cPrice]) / scale,
+        fee,
+      });
+    } else if (/sell/.test(action)) {
+      const shares = parseAmount(row[cShares]);
+      if (!iso || !shares) continue;
+      const fee = feeCols.reduce(
+        (s, f) => s + Math.abs(parseAmount(row[f.i])) / scale, 0);
+      legs.push({
+        instrument: String(row[cName] ?? row[cTicker] ?? '').trim(),
+        ticker: String(row[cTicker] ?? '').trim(),
+        category: 'Akcje',
+        currency, iso, ts: parseTimeAny(row[cTime]),
+        qty: -shares,
+        value: shares * parseAmount(row[cPrice]) / scale,
+        fee,
+      });
+    } else if (/dividend/.test(action)) {
+      const tax = cWithhold >= 0 ? Math.abs(parseAmount(row[cWithhold])) / scale : 0;
+      if (!iso) continue;
+      dividendOps.push({ iso, amount: Math.abs(total) + tax, currency });
+      if (tax) dividendTaxOps.push({ iso, amount: tax, currency });
+    } else if (/interest/.test(action)) {
+      if (!iso) continue;
+      interestOps.push({ iso, amount: Math.abs(total), currency });
+    }
+    // Deposits, withdrawals, currency conversions etc. — not tax events.
+  }
+
+  return {
+    broker: 'Trading 212',
+    positions: matchLegsFifo(legs),
+    dividendOps,
+    dividendTaxOps,
+    interestOps,
+  };
+}
+
+// ─── Revolut (Brokerage account statement, CSV/XLSX) ─────────
+
+/** True if the rows look like a Revolut brokerage account statement. */
+function isRevolutRows(rows) {
+  return rows.slice(0, 5).some(r =>
+    r.some(c => /price per share/i.test(String(c ?? ''))) &&
+    r.some(c => /total amount/i.test(String(c ?? ''))));
+}
+
+/**
+ * Parse a Revolut brokerage account statement (one row per operation,
+ * "Type" column: "BUY - MARKET", "SELL - LIMIT", "DIVIDEND", …).
+ */
+function readRevolutRows(rows) {
+  const hIdx = rows.findIndex(r =>
+    r.some(c => /price per share/i.test(String(c ?? ''))));
+  if (hIdx === -1) {
+    throw new Error('Nie znaleziono nagłówka wyciągu Revolut');
+  }
+
+  const headers = rows[hIdx].map(h => String(h ?? '').trim());
+  const col = (...names) =>
+    headers.findIndex(h => names.includes(h.toLowerCase()));
+
+  const cDate = col('date');
+  const cTicker = col('ticker');
+  const cType = col('type');
+  const cQty = col('quantity');
+  const cPrice = col('price per share');
+  const cTotal = col('total amount');
+  const cCur = col('currency');
+  const cFees = col('fees');
+  const cTaxes = col('taxes');
+
+  const legs = [];
+  const dividendOps = [];
+  const dividendTaxOps = [];
+  const interestOps = [];
+
+  for (const row of rows.slice(hIdx + 1)) {
+    const type = String(row[cType] ?? '').trim().toUpperCase();
+    if (!type) continue;
+
+    const iso = parseDateAny(row[cDate]);
+    const currency = normCurrency(row[cCur] ?? 'USD');
+    const ticker = String(row[cTicker] ?? '').trim();
+    const qty = parseAmount(row[cQty]);
+    const value = qty
+      ? qty * parseAmount(row[cPrice])
+      : Math.abs(parseAmount(row[cTotal]));
+    const fee = cFees >= 0 ? Math.abs(parseAmount(row[cFees])) : 0;
+
+    if (type.startsWith('BUY')) {
+      if (!iso || !qty) continue;
+      legs.push({
+        instrument: ticker, ticker, category: 'Akcje',
+        currency, iso, ts: parseTimeAny(row[cDate]),
+        qty, value, fee,
+      });
+    } else if (type.startsWith('SELL')) {
+      if (!iso || !qty) continue;
+      legs.push({
+        instrument: ticker, ticker, category: 'Akcje',
+        currency, iso, ts: parseTimeAny(row[cDate]),
+        qty: -qty, value, fee,
+      });
+    } else if (type.includes('DIVIDEND')) {
+      const tax = cTaxes >= 0 ? Math.abs(parseAmount(row[cTaxes])) : 0;
+      if (!iso) continue;
+      dividendOps.push({
+        iso, amount: Math.abs(parseAmount(row[cTotal])) + tax, currency,
+      });
+      if (tax) dividendTaxOps.push({ iso, amount: tax, currency });
+    } else if (type.includes('INTEREST')) {
+      if (!iso) continue;
+      interestOps.push({
+        iso, amount: Math.abs(parseAmount(row[cTotal])), currency,
+      });
+    }
+    // CASH TOP-UP, CASH WITHDRAWAL, CUSTODY FEE, transfers — skipped.
+  }
+
+  return {
+    broker: 'Revolut',
+    positions: matchLegsFifo(legs),
+    dividendOps,
+    dividendTaxOps,
+    interestOps,
+  };
+}
+
+// ─── eToro (Account Statement, XLSX/XLSM) ────────────────────
+
+/** True if the workbook looks like an eToro account statement. */
+function isEtoroWorkbook(workbook) {
+  const names = workbook.SheetNames.map(n => n.trim().toLowerCase());
+  return names.includes('account activity') ||
+    names.includes('financial summary') ||
+    (names.includes('account summary') && names.includes('closed positions'));
+}
+
+/** Detect the eToro account base currency (statements are usually USD). */
+function etoroCurrency(workbook) {
+  const ws = xtbSheet(workbook, 'account summary');
+  if (ws) {
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+    for (const r of rows) {
+      for (let i = 0; i < r.length - 1; i++) {
+        const label = String(r[i] ?? '').trim().toLowerCase();
+        if (/currency/.test(label)) {
+          const m = String(r[i + 1] ?? '').trim().match(/^[A-Za-z]{3}$/);
+          if (m) return m[0].toUpperCase();
+        }
+      }
+    }
+  }
+  return 'USD';
+}
+
+/**
+ * Parse an eToro account statement. "Closed Positions" gives complete
+ * open/close pairs (no FIFO needed). Direction "Buy" is a long position
+ * (cost at open date, revenue at close date), "Sell" is a short one.
+ * Leverage > 1 marks CFDs. The Dividends sheet is informational.
+ */
+function readEtoroReport(workbook) {
+  const closedWs = xtbSheet(workbook, 'closed positions');
+  if (!closedWs) {
+    throw new Error('Nie znaleziono arkusza "Closed Positions" w pliku eToro');
+  }
+
+  const rows = XLSX.utils.sheet_to_json(closedWs, {
+    header: 1, raw: true, defval: null,
+  });
+  const hIdx = rows.findIndex(r =>
+    r.some(c => /position\s*id|open\s*rate|open\s*date/i.test(String(c ?? ''))));
+  if (hIdx === -1) {
+    throw new Error('Nie znaleziono nagłówka arkusza "Closed Positions" (eToro)');
+  }
+
+  const headers = rows[hIdx].map(h => String(h ?? '').trim());
+  const colRe = (re) => headers.findIndex(h => re.test(h.toLowerCase()));
+  const cInstrument = colRe(/^instrument/);
+  const cDirection = colRe(/^direction/);
+  const cUnits = colRe(/^size|units/);
+  const cAmount = colRe(/^amount$|invested/);
+  const cOpenDate = colRe(/^open date|^opened/);
+  const cCloseDate = colRe(/^close date|^closed/);
+  const cOpenRate = colRe(/^open rate/);
+  const cCloseRate = colRe(/^close rate/);
+  const cLeverage = colRe(/^leverage/);
+  const cProfit = colRe(/^profit/);
+
+  const currency = etoroCurrency(workbook);
+  const positions = [];
+
+  for (const row of rows.slice(hIdx + 1)) {
+    const instrument = String(row[cInstrument] ?? '').trim();
+    if (!instrument || /^(total|profit\/loss)$/i.test(instrument)) continue;
+
+    const openIso = parseDateAny(row[cOpenDate]);
+    const closeIso = parseDateAny(row[cCloseDate]);
+    if (!openIso || !closeIso) continue; // open position — no tax event yet
+
+    const openRate = parseAmount(row[cOpenRate]);
+    const closeRate = parseAmount(row[cCloseRate]);
+    let units = cUnits >= 0 ? parseAmount(row[cUnits]) : 0;
+    if (!units && cAmount >= 0 && openRate) {
+      units = parseAmount(row[cAmount]) / openRate; // legacy "Amount" exports
+    }
+    if (!units) continue;
+
+    const isShort = String(row[cDirection] ?? '').trim().toLowerCase().startsWith('s');
+    const leverage = cLeverage >= 0 ? parseAmount(row[cLeverage]) : 1;
+
+    positions.push({
+      instrument,
+      ticker: instrument,
+      category: leverage > 1 ? 'CFD' : 'Akcje',
+      type: isShort ? 'SELL' : 'BUY',
+      currency,
+      volume: units,
+      // Long: buy at open, sell at close. Short: the other way round.
+      costValue: (isShort ? closeRate : openRate) * units,
+      revenueValue: (isShort ? openRate : closeRate) * units,
+      costIso: isShort ? closeIso : openIso,
+      saleIso: isShort ? openIso : closeIso,
+      profit: cProfit >= 0 ? parseAmount(row[cProfit]) : 0,
+    });
+  }
+
+  const dividendOps = [];
+  const dividendTaxOps = [];
+  const divWs = xtbSheet(workbook, 'dividends');
+  if (divWs) {
+    const dRows = XLSX.utils.sheet_to_json(divWs, {
+      header: 1, raw: true, defval: null,
+    });
+    const dh = dRows.findIndex(r =>
+      r.some(c => /net amount|gross amount|withholding/i.test(String(c ?? ''))));
+    if (dh !== -1) {
+      const dHeaders = dRows[dh].map(h => String(h ?? '').trim());
+      const dCol = (re) => dHeaders.findIndex(h => re.test(h.toLowerCase()));
+      const dDate = dCol(/date/);
+      const dGross = dCol(/gross amount/);
+      const dNet = dCol(/net amount/);
+      const dTax = dCol(/withholding/);
+      for (const row of dRows.slice(dh + 1)) {
+        const iso = parseDateAny(row[dDate]);
+        if (!iso) continue;
+        const net = dNet >= 0 ? parseAmount(row[dNet]) : 0;
+        const tax = dTax >= 0 ? Math.abs(parseAmount(row[dTax])) : 0;
+        const gross = dGross >= 0 ? parseAmount(row[dGross]) : net + tax;
+        if (!gross && !tax) continue;
+        if (gross) dividendOps.push({ iso, amount: gross, currency });
+        if (tax) dividendTaxOps.push({ iso, amount: tax, currency });
+      }
+    }
+  }
+
+  return {
+    broker: 'eToro',
+    positions,
+    dividendOps,
+    dividendTaxOps,
+    interestOps: [],
+  };
+}
+
+// ─── Multi-currency NBP rates ────────────────────────────────
+
+/**
+ * NBP rate for one transaction. Handles both rate maps: legacy ones
+ * keyed by ISO date (single-currency flows) and multi-currency maps
+ * keyed "CUR|ISO". PLN amounts need no conversion (rate 1).
+ */
+function rateFor(rates, currency, iso) {
+  const cur = String(currency ?? 'USD').toUpperCase();
+  if (cur === 'PLN') return { rate: 1, effectiveDate: null };
+  const entry = rates.get(`${cur}|${iso}`) ?? rates.get(iso);
+  if (!entry) throw new Error(`Brak kursu NBP dla daty ${iso}`);
+  return entry;
+}
+
+/**
+ * Fetch NBP rates for [{ iso, currency }] entries (non-PLN only).
+ * Currencies are fetched independently using the same chunked range
+ * queries as the single-currency flow. Returns a Map keyed "CUR|ISO"
+ * → { rate, effectiveDate }. onProgress(iso, cur, result) per lookup.
+ */
+async function fetchNbpRatesMulti(entries, onProgress) {
+  const byCur = new Map();
+  for (const e of entries) {
+    const cur = String(e.currency ?? 'USD').toUpperCase();
+    if (cur === 'PLN' || !e.iso) continue;
+    if (!byCur.has(cur)) byCur.set(cur, new Set());
+    byCur.get(cur).add(e.iso);
+  }
+
+  const ratesMap = new Map();
+  for (const [cur, isoSet] of byCur) {
+    const dates = [...isoSet].sort();
+    const available = await fetchNbpRateRange(
+      cur.toLowerCase(),
+      subtractDays(dates[0], 7),
+      dates[dates.length - 1],
+    );
+    for (const iso of isoSet) {
+      const entry = findPrevBusinessRate(available, iso);
+      if (!entry) {
+        throw new Error(
+          `Nie udało się pobrać kursu NBP dla daty ${iso} (sprawdzono 7 dni wstecz)`);
+      }
+      const result = { rate: entry.mid, effectiveDate: entry.effectiveDate };
+      ratesMap.set(`${cur}|${iso}`, result);
+      if (onProgress) onProgress(iso, cur, result);
+    }
+  }
+  return ratesMap;
+}
+
+// ─── Broker summaries & rendering ────────────────────────────
+
+/**
+ * Per-tax-year summary for multi-currency positions: PLN totals for
+ * PIT-38 plus per-currency subtotals. Each side is converted at the NBP
+ * rate of its own transaction date.
+ */
+function brokerYearSummaries(positions, rates) {
+  const byYear = new Map();
+  for (const p of positions) {
+    const year = p.saleIso.slice(0, 4);
+    if (!byYear.has(year)) {
+      byYear.set(year, { year, revenuePln: 0, costPln: 0, byCurrency: new Map() });
+    }
+    const y = byYear.get(year);
+    y.revenuePln += p.revenueValue * rateFor(rates, p.currency, p.saleIso).rate;
+    y.costPln += p.costValue * rateFor(rates, p.currency, p.costIso).rate;
+    const c = y.byCurrency.get(p.currency) ?? { revenue: 0, cost: 0 };
+    c.revenue += p.revenueValue;
+    c.cost += p.costValue;
+    y.byCurrency.set(p.currency, c);
+  }
+
+  return [...byYear.values()]
+    .sort((a, b) => a.year.localeCompare(b.year))
+    .map(y => {
+      const taxablePln = y.revenuePln - y.costPln;
+      return {
+        ...y,
+        taxablePln,
+        taxPln: Math.round(Math.max(0, taxablePln) * 0.19 * 100) / 100,
+      };
+    });
+}
+
+/** Per-currency totals of a position group: Map<currency, {revenue, cost}>. */
+function brokerCurrencyTotals(positions) {
+  const totals = new Map();
+  for (const p of positions) {
+    const c = totals.get(p.currency) ?? { revenue: 0, cost: 0 };
+    c.revenue += p.revenueValue;
+    c.cost += p.costValue;
+    totals.set(p.currency, c);
+  }
+  return totals;
+}
+
+function renderBrokerPositionsTable(positions, rates) {
+  const rows = positions.map((p, i) => {
+    const costRate = rateFor(rates, p.currency, p.costIso).rate;
+    const saleRate = rateFor(rates, p.currency, p.saleIso).rate;
+    return `<tr>
+      <td class="num">${i + 1}</td>
+      <td>${esc(p.instrument)}</td>
+      <td>${esc(p.ticker)}</td>
+      <td class="num">${fmt(p.volume, 3)}</td>
+      <td>${esc(p.currency)}</td>
+      <td>${esc(formatDate(p.costIso))}</td>
+      <td class="num">${fmt(p.costValue)}</td>
+      <td class="num">${fmt(p.costValue * costRate)}</td>
+      <td>${esc(formatDate(p.saleIso))}</td>
+      <td class="num">${fmt(p.revenueValue)}</td>
+      <td class="num">${fmt(p.revenueValue * saleRate)}</td>
+    </tr>`;
+  }).join('');
+
+  const totVolume = positions.reduce((s, p) => s + p.volume, 0);
+  const totCostPln = positions.reduce(
+    (s, p) => s + p.costValue * rateFor(rates, p.currency, p.costIso).rate, 0);
+  const totRevenuePln = positions.reduce(
+    (s, p) => s + p.revenueValue * rateFor(rates, p.currency, p.saleIso).rate, 0);
+
+  return `<table class="transactions-table">
+    <thead><tr>
+      <th>Lp</th><th>Instrument</th><th>Ticker</th><th>Ilość</th><th>Waluta</th>
+      <th>Data kosztu</th><th>Koszt</th><th>Koszt PLN</th>
+      <th>Data sprzedaży</th><th>Przychód</th><th>Przychód PLN</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+    <tfoot><tr>
+      <td></td><td></td><td></td>
+      <td class="num">${fmt(totVolume, 3)}</td>
+      <td></td><td></td><td></td>
+      <td class="num">${fmt(totCostPln)}</td>
+      <td></td><td></td>
+      <td class="num">${fmt(totRevenuePln)}</td>
+    </tr></tfoot>
+  </table>`;
+}
+
+/** Summary/annual table header: one column per currency + PLN. */
+function brokerCurHeader(totals) {
+  const curs = [...totals.keys()].sort();
+  return curs.map(c => `<th>${esc(c)}</th>`).join('') + '<th>PLN</th>';
+}
+
+/** Row cells: per-currency values from totals + one PLN value. */
+function brokerCurCells(totals, field, plnValue) {
+  const curs = [...totals.keys()].sort();
+  return curs.map(c =>
+    `<td class="num">${fmt(totals.get(c)[field])}</td>`).join('') +
+    `<td class="num">${fmt(plnValue)}</td>`;
+}
+
+function renderBrokerSaleGroup(saleIso, positions, rates) {
+  const totals = brokerCurrencyTotals(positions);
+  const { rate: saleRate, effectiveDate: saleRateDate } =
+    rateFor(rates, positions[0].currency, saleIso);
+
+  let revenuePln = 0, costPln = 0;
+  for (const p of positions) {
+    revenuePln += p.revenueValue * rateFor(rates, p.currency, p.saleIso).rate;
+    costPln += p.costValue * rateFor(rates, p.currency, p.costIso).rate;
+  }
+
+  const categories = [...new Set(positions.map(p => p.category).filter(Boolean))]
+    .sort().join(', ') || '?';
+
+  const singleCur = totals.size === 1 ? positions[0].currency : null;
+  const nbpSaleRow = singleCur && singleCur !== 'PLN'
+    ? `<div class="meta-row">
+        <span class="meta-label">Kurs NBP przychód (${esc(saleRateDate)}):</span>
+        <span class="meta-value">${fmt(saleRate, 4)} PLN/${esc(singleCur)}</span>
+       </div>`
+    : '';
+
+  return `
+  <div class="sale-group xtb">
+    <div class="sale-header">
+      <div class="meta-row">
+        <span class="meta-label">Data sprzedaży:</span>
+        <span class="meta-value">${esc(formatDate(saleIso))}</span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Typ:</span>
+        <span class="meta-value">
+          <span class="type-badge xtb">${esc(categories)}</span>
+        </span>
+      </div>
+      ${nbpSaleRow}
+      <div class="meta-row">
+        <span class="meta-label">Liczba pozycji:</span>
+        <span class="meta-value">${positions.length}</span>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      ${renderBrokerPositionsTable(positions, rates)}
+    </div>
+
+    <div class="group-summary">
+      <table class="summary-subtable">
+        <thead>
+          <tr><th></th>${brokerCurHeader(totals)}<th></th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Przychód (podatk.)</td>
+            ${brokerCurCells(totals, 'revenue', revenuePln)}
+            <td></td>
+          </tr>
+          <tr>
+            <td>Koszty uzyskania</td>
+            ${brokerCurCells(totals, 'cost', costPln)}
+            <td class="note">(kursy NBP z dni poprzedzających zakup)</td>
+          </tr>
+          <tr class="taxable-row">
+            <td><strong>Do opodatkowania</strong></td>
+            ${[...totals.keys()].sort().map(c =>
+              `<td class="num"><strong>${fmt(totals.get(c).revenue - totals.get(c).cost)}</strong></td>`
+            ).join('')}
+            <td class="num"><strong>${fmt(revenuePln - costPln)}</strong></td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function renderBrokerAnnualSummaries(years) {
+  return years.map(y => {
+    const totals = y.byCurrency;
+    const curs = [...totals.keys()].sort();
+    const lossRow = y.taxablePln <= 0
+      ? `<tr><td colspan="${curs.length + 2}" class="note">
+           Strata w tym roku — nie powstaje obowiązek podatkowy.
+         </td></tr>`
+      : '';
+
+    return `
+    <div class="annual-summary">
+      <div class="annual-title">Podsumowanie roczne ${esc(y.year)} (do PIT-38)</div>
+      <table class="annual-table">
+        <thead>
+          <tr><th></th>${brokerCurHeader(totals)}<th></th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Przychód (sprzedaż)</td>
+            ${brokerCurCells(totals, 'revenue', y.revenuePln)}
+            <td></td>
+          </tr>
+          <tr>
+            <td>Koszty uzyskania</td>
+            ${brokerCurCells(totals, 'cost', y.costPln)}
+            <td></td>
+          </tr>
+          <tr class="separator-row"><td colspan="${curs.length + 2}"></td></tr>
+          <tr class="highlight-row">
+            <td>Przychód łączny</td>
+            ${brokerCurCells(totals, 'revenue', y.revenuePln)}
+            <td class="note">← poz. 22 PIT-38</td>
+          </tr>
+          <tr class="highlight-row">
+            <td>Koszty łączne</td>
+            ${brokerCurCells(totals, 'cost', y.costPln)}
+            <td class="note">← poz. 23 PIT-38</td>
+          </tr>
+          <tr class="highlight-row">
+            <td>Do opodatkowania</td>
+            ${[...totals.keys()].sort().map(c =>
+              `<td class="num">${fmt(totals.get(c).revenue - totals.get(c).cost)}</td>`
+            ).join('')}
+            <td class="num"><strong>${fmt(y.taxablePln)}</strong></td>
+            <td class="note">← poz. 29 PIT-ZG</td>
+          </tr>
+          ${lossRow}
+          <tr class="tax-final-row">
+            <td>Podatek (19%)</td>
+            ${curs.map(() => '<td></td>').join('')}
+            <td class="num tax-amount">${fmt(y.taxPln)} PLN</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>`;
+  }).join('');
+}
+
+function renderBrokerIncomeInfo(dividendOps, dividendTaxOps, interestOps, rates) {
+  const all = [...dividendOps, ...dividendTaxOps, ...interestOps];
+  if (all.length === 0) return '';
+
+  const byYear = new Map();
+  const add = (op, key) => {
+    if (!op.iso) return;
+    const year = op.iso.slice(0, 4);
+    if (!byYear.has(year)) {
+      byYear.set(year, {
+        dividends: 0, dividendsPln: 0,
+        tax: 0, taxPln: 0,
+        interest: 0, interestPln: 0,
+      });
+    }
+    const y = byYear.get(year);
+    const rate = rateFor(rates, op.currency, op.iso).rate;
+    y[key] += op.amount;
+    y[key + 'Pln'] += op.amount * rate;
+  };
+  dividendOps.forEach(op => add(op, 'dividends'));
+  dividendTaxOps.forEach(op => add(op, 'tax'));
+  interestOps.forEach(op => add(op, 'interest'));
+
+  const rows = [...byYear.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([year, y]) => `<tr>
+      <td>${esc(year)}</td>
+      <td class="num">${fmt(y.dividendsPln)}</td>
+      <td class="num">${fmt(y.taxPln)}</td>
+      <td class="num">${fmt(y.interestPln)}</td>
+    </tr>`).join('');
+
+  return `
+  <div class="xtb-info">
+    <p>ℹ️ Przychody pasywne
+       <span class="muted-text">(informacyjnie — nieujęte w rozliczeniu powyżej)</span></p>
+    <table class="summary-subtable">
+      <thead>
+        <tr>
+          <th>Rok</th><th>Dywidendy brutto PLN</th>
+          <th>Podatek pobrany PLN</th><th>Odsetki PLN</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="note">Dywidendy podlegają odrębnemu opodatkowaniu 19%
+      (zryczałtowany podatek dochodowy) i nie są uwzględnione w rozliczeniu powyżej.</p>
+  </div>`;
+}
+
+function renderBrokerResults(report, rates) {
+  const { positions, dividendOps, dividendTaxOps, interestOps } = report;
+  const groups = xtbGroupBySaleDate(positions);
+
+  const groupHtml = [...groups.entries()]
+    .map(([saleIso, ps]) => renderBrokerSaleGroup(saleIso, ps, rates))
+    .join('');
+
+  const annualHtml = renderBrokerAnnualSummaries(
+    brokerYearSummaries(positions, rates));
+
+  const incomeHtml = renderBrokerIncomeInfo(
+    dividendOps ?? [], dividendTaxOps ?? [], interestOps ?? [], rates);
+
+  document.getElementById('results').innerHTML =
+    groupHtml + annualHtml + incomeHtml;
+
+  return groups;
+}
+
+/** Full processing flow for one of the multi-broker reports. */
+async function processBrokerFile(file, report, brokerLabel) {
+  const { positions, dividendOps, dividendTaxOps, interestOps } = report;
+
+  if (!positions || positions.length === 0) {
+    showError(
+      `Nie znaleziono zamkniętych transakcji w pliku. ` +
+      `Upewnij się, że wczytałeś raport z ${brokerLabel}.`,
+    );
+    return;
+  }
+
+  // Collect all (date, currency) pairs that need NBP rates.
+  const rateEntries = [];
+  for (const p of positions) {
+    rateEntries.push({ iso: p.saleIso, currency: p.currency });
+    rateEntries.push({ iso: p.costIso, currency: p.currency });
+  }
+  for (const op of [...(dividendOps ?? []), ...(dividendTaxOps ?? []), ...(interestOps ?? [])]) {
+    if (op.iso) rateEntries.push({ iso: op.iso, currency: op.currency });
+  }
+  const needRates = rateEntries.filter(e => e.currency !== 'PLN');
+
+  let nbpRates = new Map();
+  if (needRates.length) {
+    const uniqueCount = new Set(
+      needRates.map(e => `${e.currency}|${e.iso}`)).size;
+    document.getElementById('loadingText').textContent =
+      `Pobieranie kursów NBP (${uniqueCount} ${uniqueCount === 1 ? 'data' : 'daty/dat'})…`;
+
+    const nbpLog = document.getElementById('nbpLog');
+    try {
+      nbpRates = await fetchNbpRatesMulti(
+        needRates,
+        (iso, cur, { rate, effectiveDate }) => {
+          const div = document.createElement('div');
+          div.className = 'nbp-log-entry';
+          div.textContent =
+            `Kurs NBP ${cur}/PLN na ${effectiveDate}: ${fmt(rate, 4)}` +
+            ` (dla daty ${formatDate(iso)})`;
+          nbpLog.appendChild(div);
+        },
+      );
+    } catch (err) {
+      showError(`Błąd NBP API: ${err.message}`);
+      return;
+    }
+  }
+
+  let groups;
+  try {
+    groups = renderBrokerResults(report, nbpRates);
+  } catch (err) {
+    showError(`Błąd podczas obliczania: ${err.message}`);
+    return;
+  }
+
+  document.getElementById('resultsFilename').textContent =
+    `${file.name} · ${brokerLabel} · ${positions.length} pozycji · ${groups.size} dni sprzedaży`;
+
+  document.getElementById('loadingSection').classList.add('hidden');
+  document.getElementById('resultsSection').classList.remove('hidden');
+}
+
+// ─────────────────────────────────────────────────────────────
 // App state & event handling
 // ─────────────────────────────────────────────────────────────
 
@@ -1184,8 +2196,10 @@ async function processXtbFile(file, arrayBuffer) {
 }
 
 async function processFile(file) {
-  if (!file.name.toLowerCase().endsWith('.xlsx')) {
-    showError('Wybierz plik w formacie .xlsx (Gains & Losses z E*TRADE).');
+  if (!/\.(xlsx|xls|xlsm|csv)$/i.test(file.name)) {
+    showError(
+      'Wybierz plik w formacie .xlsx, .xls, .xlsm lub .csv ' +
+      '(raport brokera: E*TRADE, XTB, IBKR, Trading 212, Revolut lub eToro).');
     return;
   }
 
@@ -1202,20 +2216,47 @@ async function processFile(file) {
     return;
   }
 
-  // Auto-detect the report type: XTB account statement vs E*TRADE Gains & Losses.
-  let isXtb;
+  // Auto-detect the report type (eToro, IBKR, Trading 212, Revolut,
+  // XTB or E*TRADE Gains & Losses).
+  let probe;
   try {
-    const probe = XLSX.read(new Uint8Array(arrayBuffer), {
+    probe = XLSX.read(new Uint8Array(arrayBuffer), {
       type: 'array',
       cellDates: false,
     });
-    isXtb = isXtbWorkbook(probe);
   } catch (err) {
-    showError(`Błąd podczas parsowania pliku XLSX: ${err.message}`);
+    showError(`Błąd podczas parsowania pliku: ${err.message}`);
     return;
   }
 
-  if (isXtb) {
+  const probeRows = () => XLSX.utils.sheet_to_json(
+    probe.Sheets[probe.SheetNames[0]],
+    { header: 1, raw: true, defval: null });
+
+  try {
+    if (isEtoroWorkbook(probe)) {
+      await processBrokerFile(file, readEtoroReport(probe), 'eToro');
+      return;
+    }
+    const rows = probeRows();
+    if (isIbkrRows(rows)) {
+      await processBrokerFile(file, readIbkrRows(rows), 'IBKR');
+      return;
+    }
+    if (isT212Rows(rows)) {
+      await processBrokerFile(file, readT212Rows(rows), 'Trading 212');
+      return;
+    }
+    if (isRevolutRows(rows)) {
+      await processBrokerFile(file, readRevolutRows(rows), 'Revolut');
+      return;
+    }
+  } catch (err) {
+    showError(`Błąd podczas parsowania pliku: ${err.message}`);
+    return;
+  }
+
+  if (isXtbWorkbook(probe)) {
     await processXtbFile(file, arrayBuffer);
     return;
   }

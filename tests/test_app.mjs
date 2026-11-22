@@ -47,6 +47,10 @@ const wrappedSource = `
     renderResults,
     excelSerialToIso, xtbDateToIso, isXtbWorkbook, readXtbReport,
     xtbGroupBySaleDate, xtbRate, xtbYearSummaries, findPrevBusinessRate,
+    parseAmount, parseDateAny, parseTimeAny, normCurrency,
+    matchLegsFifo, isIbkrRows, readIbkrRows, isT212Rows, readT212Rows,
+    isRevolutRows, readRevolutRows, isEtoroWorkbook, readEtoroReport,
+    rateFor, brokerYearSummaries, brokerCurrencyTotals,
   });
 `;
 eval(wrappedSource);
@@ -56,6 +60,10 @@ const {
   readTransactions, getNbpRate, fetchNbpRates, groupBySaleDate,
   excelSerialToIso, xtbDateToIso, isXtbWorkbook, readXtbReport,
   xtbGroupBySaleDate, xtbRate, xtbYearSummaries, findPrevBusinessRate,
+  parseAmount, parseDateAny, parseTimeAny, normCurrency,
+  matchLegsFifo, isIbkrRows, readIbkrRows, isT212Rows, readT212Rows,
+  isRevolutRows, readRevolutRows, isEtoroWorkbook, readEtoroReport,
+  rateFor, brokerYearSummaries, brokerCurrencyTotals,
 } = moduleScope;
 
 // ─── Load example XLSX ───────────────────────────────────────────────────
@@ -935,5 +943,393 @@ describe('xtbYearSummaries', () => {
 
     const summaries = xtbYearSummaries(twoYears, moreRates, 'USD');
     assert.deepEqual(summaries.map(s => s.year), ['2025', '2026']);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Multi-broker support (IBKR, Trading 212, Revolut, eToro)
+// ═══════════════════════════════════════════════════════════════
+
+describe('parseAmount', () => {
+  it('parses plain numbers and numeric cells', () => {
+    assert.equal(parseAmount(12.5), 12.5);
+    assert.equal(parseAmount('123.45'), 123.45);
+  });
+
+  it('strips currency prefixes and spaces', () => {
+    assert.equal(parseAmount('EUR 104.64'), 104.64);
+    assert.equal(parseAmount('USD 1 234.56'), 1234.56);
+  });
+
+  it('handles both thousand/decimal separator styles', () => {
+    assert.equal(parseAmount('1,234.56'), 1234.56);
+    assert.equal(parseAmount('1.234,56'), 1234.56);
+    assert.equal(parseAmount('1,234'), 1234);
+    assert.equal(parseAmount('12,34'), 12.34);
+  });
+
+  it('handles negatives (minus and parentheses)', () => {
+    assert.equal(parseAmount('-5'), -5);
+    assert.equal(parseAmount('(123.45)'), -123.45);
+    assert.equal(parseAmount(''), 0);
+    assert.equal(parseAmount(null), 0);
+  });
+});
+
+describe('parseDateAny / parseTimeAny / normCurrency', () => {
+  it('parses ISO timestamps to date strings', () => {
+    assert.equal(parseDateAny('2025-01-06T09:02:14.772Z'), '2025-01-06');
+    assert.equal(parseDateAny('2026-07-24 01:16:11+00:00'), '2026-07-24');
+  });
+
+  it('parses IBKR "YYYY-MM-DD, HH:MM:SS"', () => {
+    assert.equal(parseDateAny('2017-07-08, 08:53:11'), '2017-07-08');
+  });
+
+  it('parses E*TRADE dates, serials and Date objects', () => {
+    assert.equal(parseDateAny('03/15/2025'), '2025-03-15');
+    assert.equal(parseDateAny(45000), excelSerialToIso(45000));
+    assert.equal(parseDateAny(new Date(Date.UTC(2025, 0, 6))), '2025-01-06');
+    assert.equal(parseDateAny('--'), null);
+    assert.equal(parseDateAny(''), null);
+  });
+
+  it('parseTimeAny keeps the time for same-day ordering', () => {
+    assert.equal(parseTimeAny('2025-01-06T09:02:14.772Z'), '2025-01-06 09:02:14');
+    assert.equal(parseTimeAny('2025-01-06'), '2025-01-06');
+  });
+
+  it('normCurrency maps GBX to GBP', () => {
+    assert.equal(normCurrency('GBX'), 'GBP');
+    assert.equal(normCurrency('usd'), 'USD');
+    assert.equal(normCurrency(null), 'USD');
+  });
+});
+
+describe('matchLegsFifo', () => {
+  const leg = (iso, qty, value, extra = {}) => ({
+    instrument: 'X', ticker: 'X', category: 'Akcje', currency: 'USD',
+    iso, ts: iso, qty, value, fee: 0, ...extra,
+  });
+
+  it('matches long trades FIFO with partial fills', () => {
+    const positions = matchLegsFifo([
+      leg('2025-01-02', 10, 100),  // buy 10 @ 10
+      leg('2025-02-02', 10, 200),  // buy 10 @ 20
+      leg('2025-03-02', -15, 450), // sell 15 @ 30
+    ]);
+    assert.equal(positions.length, 2);
+    assert.equal(positions[0].volume, 10);
+    assert.equal(positions[0].costValue, 100);
+    assert.equal(positions[0].revenueValue, 300);
+    assert.equal(positions[0].costIso, '2025-01-02');
+    assert.equal(positions[0].saleIso, '2025-03-02');
+    assert.equal(positions[1].volume, 5);
+    assert.equal(positions[1].costValue, 100); // 5 @ 20
+    assert.equal(positions[1].revenueValue, 150);
+    assert.equal(positions[1].costIso, '2025-02-02');
+  });
+
+  it('adds both fees to the cost of the matched position', () => {
+    const positions = matchLegsFifo([
+      leg('2025-01-02', 10, 100, { fee: 2 }),
+      leg('2025-03-02', -10, 200, { fee: 3 }),
+    ]);
+    assert.equal(positions.length, 1);
+    assert.equal(positions[0].costValue, 105); // 100 + 2 + 3
+    assert.equal(positions[0].revenueValue, 200);
+  });
+
+  it('handles short positions (sell first, buy back later)', () => {
+    const positions = matchLegsFifo([
+      leg('2025-03-02', -5, 500),
+      leg('2025-04-02', 5, 400),
+    ]);
+    assert.equal(positions.length, 1);
+    assert.equal(positions[0].type, 'SELL'); // short position
+    assert.equal(positions[0].saleIso, '2025-03-02'); // sale happened first
+    assert.equal(positions[0].costIso, '2025-04-02');
+    assert.equal(positions[0].revenueValue, 500);
+    assert.equal(positions[0].costValue, 400);
+  });
+
+  it('ignores legs that never close', () => {
+    const positions = matchLegsFifo([leg('2025-01-02', 10, 100)]);
+    assert.equal(positions.length, 0);
+  });
+
+  it('orders same-day legs by time', () => {
+    const positions = matchLegsFifo([
+      { ...leg('2025-01-02', -1, 20), ts: '2025-01-02 15:00:00' },
+      { ...leg('2025-01-02', 1, 10), ts: '2025-01-02 10:00:00' },
+    ]);
+    assert.equal(positions.length, 1);
+    assert.equal(positions[0].type, 'BUY'); // long: bought 10:00, sold 15:00
+  });
+});
+
+describe('IBKR Activity Statement', () => {
+  const ibkrRows = [
+    ['Statement', 'Header', 'Field Name', 'Field Value'],
+    ['Statement', 'Data', 'BaseCurrency', 'USD'],
+    ['Trades', 'Header', 'DataDiscriminator', 'Asset Category', 'Currency', 'Symbol', 'Date/Time', 'Quantity', 'T. Price', 'C. Price', 'Proceeds', 'Comm/Fee', 'Basis', 'Realized P/L', 'MTM P/L', 'Code'],
+    ['Trades', 'Data', 'Order', 'Stocks', 'USD', 'AAPL', '2025-03-03, 15:30:00', 10, 100, 101, -1000, -1, 1001, 0, 0, 'O'],
+    ['Trades', 'Data', 'Order', 'Stocks', 'USD', 'AAPL', '2025-06-02, 15:30:00', -10, 120, 119, 1200, -1, -1001, 198, 0, 'C'],
+    ['Trades', 'Data', 'Closed Lot', 'Stocks', 'USD', 'AAPL', '2025-06-02, 15:30:00', -10, 100, 119, 1200, -1, -1001, 198, 0, 'C'],
+    ['Trades', 'SubTotal', '', 'Stocks', 'USD', 'AAPL', '', 0, 120, 119, 200, -2, 0, 198, 0, ''],
+    ['Trades', 'Total', '', 'Stocks', 'USD', '', '', 0, 120, 119, 200, -2, 0, 198, 0, ''],
+    ['Dividends', 'Header', 'Currency', 'Date', 'Description', 'Amount'],
+    ['Dividends', 'Data', 'USD', '2025-05-15', 'AAPL Cash Dividend', 2.5],
+    ['Withholding Tax', 'Header', 'Currency', 'Date', 'Description', 'Amount'],
+    ['Withholding Tax', 'Data', 'USD', '2025-05-15', 'AAPL Cash Dividend', -0.38],
+  ];
+
+  it('detects IBKR activity statement rows', () => {
+    assert.equal(isIbkrRows(ibkrRows), true);
+    assert.equal(isIbkrRows([['Action', 'Time']]), false);
+  });
+
+  it('reads trades, skips Closed Lot/SubTotal/Total rows', () => {
+    const report = readIbkrRows(ibkrRows);
+    assert.equal(report.positions.length, 1);
+    const [p] = report.positions;
+    assert.equal(p.volume, 10);
+    assert.equal(p.costValue, 1002);   // 1000 + buy 1 + sell 1 commission
+    assert.equal(p.revenueValue, 1200);
+    assert.equal(p.costIso, '2025-03-03');
+    assert.equal(p.saleIso, '2025-06-02');
+    assert.equal(p.currency, 'USD');
+  });
+
+  it('reads dividends and withholding tax (informational)', () => {
+    const report = readIbkrRows(ibkrRows);
+    assert.deepEqual(report.dividendOps, [
+      { iso: '2025-05-15', amount: 2.5, currency: 'USD' },
+    ]);
+    assert.deepEqual(report.dividendTaxOps, [
+      { iso: '2025-05-15', amount: 0.38, currency: 'USD' },
+    ]);
+  });
+
+  it('skips non-stock asset categories', () => {
+    const rows = [
+      ['Trades', 'Header', 'DataDiscriminator', 'Asset Category', 'Currency', 'Symbol', 'Date/Time', 'Quantity', 'T. Price', 'C. Price', 'Proceeds', 'Comm/Fee', 'Basis', 'Realized P/L', 'MTM P/L', 'Code'],
+      ['Trades', 'Data', 'Order', 'Equity and Index Options', 'USD', 'TSLA 27MAR26 300 C', '2025-03-03, 15:30:00', 1, 500, 510, -500, -2, 502, 0, 0, 'O'],
+      ['Trades', 'Data', 'Order', 'Stocks', 'USD', 'TSLA', '2025-03-03, 15:30:00', 1, 100, 101, -100, -1, 101, 0, 0, 'O'],
+    ];
+    const report = readIbkrRows(rows);
+    assert.equal(report.positions.length, 0); // buy legs only, options skipped
+  });
+});
+
+describe('Trading 212 export', () => {
+  const t212Rows = [
+    ['Action', 'Time', 'ISIN', 'Ticker', 'Name', 'No. of shares', 'Price / share', 'Currency (Price / share)', 'Exchange rate', 'Result', 'Total', 'Withholding tax', 'Charge amount', 'Currency conversion fee', 'Notes', 'ID'],
+    ['Market buy', '2025-02-03 10:00:00+00:00', 'US0378331005', 'AAPL', 'Apple', 5, 150, 'USD', 4.1, null, -750, null, 0, 1.2, '', '1'],
+    ['Market sell', '2025-07-14 10:00:00+00:00', 'US0378331005', 'AAPL', 'Apple', 5, 200, 'USD', 4.0, 250, 1000, null, 0, 1.5, '', '2'],
+    ['Dividend (Ordinary)', '2025-05-15 10:00:00+00:00', 'US0378331005', 'AAPL', 'Apple', 5, null, 'USD', 4.1, null, 2.13, 0.38, null, null, '', '3'],
+    ['Market buy', '2025-03-03 10:00:00+00:00', 'GB0002374006', 'HSBA', 'HSBC', 10, 500, 'GBX', 5.2, null, -50, null, 0, null, '', '4'],
+    ['Deposit', '2025-01-01 09:00:00+00:00', null, null, null, null, null, null, null, null, 10000, null, null, null, '', '5'],
+  ];
+
+  it('detects Trading 212 rows', () => {
+    assert.equal(isT212Rows(t212Rows), true);
+    assert.equal(isT212Rows(ibkrFixtureRows()), false);
+  });
+
+  it('matches buy/sell into a position', () => {
+    const report = readT212Rows(t212Rows);
+    assert.equal(report.positions.length, 1);
+    const [p] = report.positions;
+    assert.equal(p.volume, 5);
+    assert.equal(p.costValue, 750);
+    assert.equal(p.revenueValue, 1000);
+    assert.equal(p.costIso, '2025-02-03');
+    assert.equal(p.saleIso, '2025-07-14');
+    assert.equal(p.currency, 'USD');
+  });
+
+  it('converts GBX (pence) to GBP and skips deposits', () => {
+    const report = readT212Rows(t212Rows);
+    // The HSBC buy stays open (no sell) — not in positions…
+    assert.ok(!report.positions.some(p => p.ticker === 'HSBA'));
+    // …but a closed GBX trade would be denominated in GBP.
+    const rows = [t212Rows[0], t212Rows[4], [
+      'Market sell', '2025-04-03 10:00:00+00:00', 'GB0002374006', 'HSBA', 'HSBC', 10, 600, 'GBX', 5.2, null, 60, null, 0, null, '', '6',
+    ]];
+    const [p] = readT212Rows(rows).positions;
+    assert.equal(p.currency, 'GBP');
+    assert.equal(p.costValue, 50);  // 10 × 500 GBX = 5 000 pence = £50
+    assert.equal(p.revenueValue, 60);
+  });
+
+  it('reads dividends with withholding tax (informational)', () => {
+    const report = readT212Rows(t212Rows);
+    assert.deepEqual(report.dividendOps, [
+      { iso: '2025-05-15', amount: 2.51, currency: 'USD' },
+    ]);
+    assert.deepEqual(report.dividendTaxOps, [
+      { iso: '2025-05-15', amount: 0.38, currency: 'USD' },
+    ]);
+  });
+});
+
+function ibkrFixtureRows() {
+  return [
+    ['Statement', 'Header', 'Field Name', 'Field Value'],
+    ['Trades', 'Header', 'DataDiscriminator', 'Asset Category', 'Currency', 'Symbol', 'Date/Time', 'Quantity', 'T. Price'],
+  ];
+}
+
+describe('Revolut statement', () => {
+  const revolutRows = [
+    ['Date', 'Ticker', 'Type', 'Quantity', 'Price per share', 'Total Amount', 'Currency', 'FX Rate', 'Fees', 'Taxes'],
+    ['2025-01-06T09:02:14.772Z', 'AAPL', 'BUY - MARKET', 2, 'EUR 100.00', 200, 'EUR', 1, 0.5, 0],
+    ['2025-04-02T14:05:00.000Z', 'AAPL', 'SELL - MARKET', 2, 'EUR 120.00', 240, 'EUR', 1, 0.5, 0],
+    ['2025-03-10T00:00:00.000Z', 'AAPL', 'DIVIDEND', null, null, 1.85, 'EUR', 1, 0, 0.28],
+    ['2025-01-01T00:00:00.000Z', null, 'CASH TOP-UP', null, null, 1000, 'EUR', 1, 0, 0],
+  ];
+
+  it('detects Revolut rows', () => {
+    assert.equal(isRevolutRows(revolutRows), true);
+    assert.equal(isRevolutRows(t212FixtureRows()), false);
+  });
+
+  it('matches BUY/SELL rows into a position with fees in cost', () => {
+    const report = readRevolutRows(revolutRows);
+    assert.equal(report.positions.length, 1);
+    const [p] = report.positions;
+    assert.equal(p.volume, 2);
+    assert.equal(p.costValue, 201);    // 2 × 100 + 0.5 + 0.5 fees
+    assert.equal(p.revenueValue, 240); // 2 × 120
+    assert.equal(p.costIso, '2025-01-06');
+    assert.equal(p.saleIso, '2025-04-02');
+    assert.equal(p.currency, 'EUR');
+  });
+
+  it('reads dividends and skips cash top-ups', () => {
+    const report = readRevolutRows(revolutRows);
+    assert.deepEqual(report.dividendOps, [
+      { iso: '2025-03-10', amount: 2.13, currency: 'EUR' },
+    ]);
+    assert.deepEqual(report.dividendTaxOps, [
+      { iso: '2025-03-10', amount: 0.28, currency: 'EUR' },
+    ]);
+    assert.equal(report.interestOps.length, 0);
+  });
+});
+
+function t212FixtureRows() {
+  return [
+    ['Action', 'Time', 'ISIN', 'Ticker', 'Name', 'No. of shares', 'Price / share', 'Currency (Price / share)', 'Total'],
+  ];
+}
+
+describe('eToro account statement', () => {
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ['Account Summary'],
+    ['Account Base Currency', 'USD'],
+  ]), 'Account Summary');
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ['Position ID', 'Instrument', 'Direction', 'Size (units)', 'Open Date', 'Close Date', 'Open Rate', 'Close Rate', 'Leverage', 'Fees and Dividends', 'Profit'],
+    [1, 'Apple', 'Buy', 10, '2025-01-06', '2025-04-02', 100, 120, 1, 0, 200],
+    [2, 'Tesla', 'Sell', 5, '2025-02-03', '2025-03-03', 200, 180, 1, 0, 100],
+    [3, 'Bitcoin', 'Buy', 1, '2025-05-05', null, 50000, null, 1, 0, 0],
+  ]), 'Closed Positions');
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ['Position ID', 'Instrument', 'Date', 'Net Amount', 'Withholding Tax'],
+    [1, 'Apple', '2025-03-10', 1.72, 0.28],
+  ]), 'Dividends');
+
+  it('detects an eToro workbook', () => {
+    assert.equal(isEtoroWorkbook(workbook), true);
+    assert.equal(isEtoroWorkbook({ SheetNames: ['Closed Positions', 'Cash Operations'] }), false);
+  });
+
+  it('reads long and short closed positions, skips open ones', () => {
+    const report = readEtoroReport(workbook);
+    assert.equal(report.positions.length, 2);
+
+    const [long, short] = report.positions;
+    assert.equal(long.type, 'BUY');
+    assert.equal(long.costValue, 1000);    // 10 × 100 at open
+    assert.equal(long.revenueValue, 1200); // 10 × 120 at close
+    assert.equal(long.costIso, '2025-01-06');
+    assert.equal(long.saleIso, '2025-04-02');
+
+    assert.equal(short.type, 'SELL');
+    assert.equal(short.saleIso, '2025-02-03'); // short: sale at open
+    assert.equal(short.revenueValue, 1000);    // 5 × 200
+    assert.equal(short.costIso, '2025-03-03');
+    assert.equal(short.costValue, 900);        // 5 × 180 at close
+  });
+
+  it('uses the account base currency from Account Summary', () => {
+    const report = readEtoroReport(workbook);
+    assert.equal(report.positions[0].currency, 'USD');
+  });
+
+  it('reads dividends (gross = net + withholding)', () => {
+    const report = readEtoroReport(workbook);
+    assert.deepEqual(report.dividendOps, [
+      { iso: '2025-03-10', amount: 2, currency: 'USD' },
+    ]);
+    assert.deepEqual(report.dividendTaxOps, [
+      { iso: '2025-03-10', amount: 0.28, currency: 'USD' },
+    ]);
+  });
+});
+
+describe('rateFor & brokerYearSummaries (multi-currency)', () => {
+  const rates = new Map([
+    ['USD|2025-01-06', { rate: 4.0, effectiveDate: '2025-01-03' }],
+    ['USD|2025-04-02', { rate: 4.2, effectiveDate: '2025-04-01' }],
+    ['EUR|2025-01-06', { rate: 4.1, effectiveDate: '2025-01-03' }],
+    ['EUR|2025-04-02', { rate: 4.3, effectiveDate: '2025-04-01' }],
+  ]);
+
+  it('rateFor reads multi-currency keys, legacy keys and PLN', () => {
+    assert.equal(rateFor(rates, 'USD', '2025-01-06').rate, 4.0);
+    assert.equal(rateFor(rates, 'PLN', '2025-01-06').rate, 1);
+    const legacy = new Map([['2025-01-06', { rate: 3.9, effectiveDate: '2025-01-03' }]]);
+    assert.equal(rateFor(legacy, 'USD', '2025-01-06').rate, 3.9);
+  });
+
+  it('converts each side at its own date and currency', () => {
+    const positions = [
+      {
+        instrument: 'A', ticker: 'A', category: 'Akcje', currency: 'USD',
+        type: 'BUY', volume: 1, costValue: 100, revenueValue: 120,
+        costIso: '2025-01-06', saleIso: '2025-04-02',
+      },
+      {
+        instrument: 'B', ticker: 'B', category: 'Akcje', currency: 'EUR',
+        type: 'BUY', volume: 1, costValue: 50, revenueValue: 60,
+        costIso: '2025-01-06', saleIso: '2025-04-02',
+      },
+    ];
+    const [y] = brokerYearSummaries(positions, rates);
+    assert.equal(y.year, '2025');
+    // 120×4.2 + 60×4.3 = 504 + 258 = 762
+    assert.equal(y.revenuePln, 762);
+    // 100×4.0 + 50×4.1 = 400 + 205 = 605
+    assert.equal(y.costPln, 605);
+    assert.equal(y.taxablePln, 157);
+    assert.equal(y.taxPln, Math.round(157 * 0.19 * 100) / 100);
+    // per-currency subtotals are kept in original currencies
+    assert.deepEqual(y.byCurrency.get('USD'), { revenue: 120, cost: 100 });
+    assert.deepEqual(y.byCurrency.get('EUR'), { revenue: 60, cost: 50 });
+  });
+
+  it('loss years have zero tax', () => {
+    const positions = [{
+      instrument: 'A', ticker: 'A', category: 'Akcje', currency: 'USD',
+      type: 'BUY', volume: 1, costValue: 100, revenueValue: 50,
+      costIso: '2025-01-06', saleIso: '2025-04-02',
+    }];
+    const [y] = brokerYearSummaries(positions, rates);
+    assert.ok(y.taxablePln < 0);
+    assert.equal(y.taxPln, 0);
   });
 });
