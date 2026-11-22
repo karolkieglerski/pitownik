@@ -2379,6 +2379,12 @@ function renderMarkdown(md) {
       if (/^(https?:|mailto:|#)/i.test(href)) {
         return `<a href="${href}" target="_blank" rel="noopener">${text}</a>`;
       }
+      // Strony HTML (np. web/index.html) — zwykła nawigacja, nie dokument.
+      // Aplikacja jest serwowana z treści katalogu web/, więc ścieżka
+      // "web/..." jest skraciana (lokalnie i na GitHub Pages).
+      if (/\.html?(#.*)?$/i.test(href)) {
+        return `<a href="${esc(href.replace(/^web\//, ''))}" target="_blank" rel="noopener">${text}</a>`;
+      }
       // Link wewnętrzny (np. LICENSE w OPEN_SOURCE.md) — otwórz w popupie.
       return `<a href="#" data-doc="${esc(href)}">${text}</a>`;
     });
@@ -2515,12 +2521,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Escape') closeDocModal();
   });
 
-  // Linki wewnątrz popupu (np. LICENSE w OPEN_SOURCE.md) też otwierają popup.
+  // Linki wewnątrz popupu: dokumenty (data-doc) otwierają popup,
+  // link do samej aplikacji (index.html) po prostu go zamyka.
   document.getElementById('docModalBody').addEventListener('click', e => {
-    const link = e.target.closest('a[data-doc]');
-    if (link) {
+    const link = e.target.closest('a');
+    if (!link) return;
+    if (link.dataset.doc) {
       e.preventDefault();
       openDocModal(link.dataset.doc, link.textContent.trim());
+      return;
+    }
+    const href = link.getAttribute('href') || '';
+    if (/index\.html$/.test(href)) {
+      e.preventDefault();
+      closeDocModal();
     }
   });
 });
