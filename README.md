@@ -109,5 +109,7 @@ bez kluczy API i bez zmiennych środowiskowych.
 
 [MIT](LICENSE) — szczegóły w [OPEN_SOURCE.md](OPEN_SOURCE.md).
 
-Aplikacja ma charakter wyłącznie informacyjny. Przed złożeniem zeznania PIT-38
+⚠️ **Zastrzeżenie:** Program ma charakter wyłącznie informacyjny i pomocniczy.
+Autorzy nie ponoszą odpowiedzialności za błędy w obliczeniach ani za konsekwencje
+wynikające z użycia programu w deklaracjach podatkowych. Przed złożeniem PIT-38
 zweryfikuj obliczenia z doradcą podatkowym.
