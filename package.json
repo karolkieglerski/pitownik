@@ -1,7 +1,7 @@
 {
   "name": "pitownik",
   "version": "1.0.0",
-  "description": "Kalkulator PIT-38 na podstawie danych z E*TRADE (RSU, ESPP) i XTB, kursy NBP.",
+  "description": "Kalkulator PIT-38 na podstawie danych z E*TRADE (RSU, ESPP), XTB, IBKR, Trading 212, Revolut i eToro — kursy NBP.",
   "main": "web/app.js",
   "directories": {
     "test": "tests"
@@ -10,7 +10,7 @@
     "test": "node --test tests/test_app.mjs",
     "serve": "python3 -m http.server 8080"
   },
-  "keywords": ["PIT-38", "RSU", "ESPP", "E*TRADE", "XTB", "podatek", "NBP", "kalkulator"],
+  "keywords": ["PIT-38", "RSU", "ESPP", "E*TRADE", "XTB", "IBKR", "Trading 212", "Revolut", "eToro", "podatek", "NBP", "kalkulator"],
   "author": "Karol Kieglerski",
   "license": "MIT",
   "devDependencies": {

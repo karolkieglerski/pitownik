@@ -2,7 +2,8 @@
 
 /* ═══════════════════════════════════════════════════════════════
    pitownik — app.js
-   Kalkulator PIT-38 na podstawie pliku Gains & Losses z E*TRADE
+   Kalkulator PIT-38 na podstawie raportów brokerskich (E*TRADE,
+   XTB, IBKR, Trading 212, Revolut, eToro) — .xlsx/.xls/.xlsm/.csv
    ═══════════════════════════════════════════════════════════════ */
 
 const WIRE_FEE_USD = 20.0; // $10 E*TRADE + $10 bank fee
@@ -2265,7 +2266,7 @@ async function processFile(file) {
   try {
     transactions = readTransactions(arrayBuffer);
   } catch (err) {
-    showError(`Błąd podczas parsowania pliku XLSX: ${err.message}`);
+    showError(`Błąd podczas parsowania pliku Excel/CSV: ${err.message}`);
     return;
   }
 

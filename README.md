@@ -3,8 +3,9 @@
 **Kalkulator PIT-38** dla inwestorów korzystających z **E\*TRADE** (RSU, ESPP),
 **XTB**, **Interactive Brokers**, **Trading 212**, **Revolut** lub **eToro**.
 
-Wrzuć raport `.xlsx` z brokera, a aplikacja policzy przychód, koszt uzyskania,
-kwotę do opodatkowania i podatek (19%) — z przeliczeniem na PLN po kursach NBP.
+Wrzuć raport z brokera (`.xlsx`, `.xls`, `.xlsm` lub `.csv`), a aplikacja policzy
+przychód, koszt uzyskania, kwotę do opodatkowania i podatek (19%) —
+z przeliczeniem na PLN po kursach NBP.
 
 **Wersja online (GitHub Pages):** <https://karolkieglerski.github.io/pitownik/>
 
@@ -55,7 +56,8 @@ Bez instalacji — wystarczy przeglądarka:
 
 1. Otwórz **<https://karolkieglerski.github.io/pitownik/>** (wersja online na
    GitHub Pages) albo lokalnie `web/index.html`.
-2. Przeciągnij raport `.xlsx` z brokera na stronę (lub wybierz plik).
+2. Przeciągnij raport z brokera na stronę (lub wybierz plik) — `.xlsx`, `.xls`,
+   `.xlsm` albo `.csv`, w zależności od brokera.
 3. Poczekaj na pobranie kursów NBP i gotowe.
 
 Lokalny serwer deweloperski:
@@ -71,8 +73,9 @@ npm run serve      # http://localhost:8080 → otwórz web/index.html
 npm test           # node --test tests/test_app.mjs (Node.js ≥ 20)
 ```
 
-Testy obejmują parsowanie XLSX, logikę podatkową RSU/ESPP, przeliczenia NBP
-(mockowane), reguły opłaty za przelew oraz parsowanie i podsumowania XTB.
+Testy obejmują parsowanie XLSX/CSV, logikę podatkową RSU/ESPP, przeliczenia NBP
+(mockowane), reguły opłaty za przelew, parsowanie i podsumowania XTB oraz
+parsery IBKR, Trading 212, Revolut i eToro (w tym parowanie FIFO).
 Szczegóły w [tests/README.md](tests/README.md).
 
 Dane testowe są anonimizowane (fikcyjne „ACME") — można je wygenerować ponownie:
@@ -102,8 +105,8 @@ tylko jeśli testy przejdą).
 ## Technologie
 
 Vanilla JavaScript (ES2020+), HTML/CSS, [SheetJS](https://sheetjs.com/) do parsowania
-`.xlsx`, publiczne [API NBP](https://api.nbp.pl/). Bez frameworków, bez bundlera,
-bez kluczy API i bez zmiennych środowiskowych.
+`.xlsx`/`.xls`/`.xlsm`/`.csv`, publiczne [API NBP](https://api.nbp.pl/). Bez frameworków,
+bez bundlera, bez kluczy API i bez zmiennych środowiskowych.
 
 ## Licencja i zastrzeżenie
 
