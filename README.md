@@ -5,6 +5,8 @@
 Wrzuć raport `.xlsx` z brokera, a aplikacja policzy przychód, koszt uzyskania,
 kwotę do opodatkowania i podatek (19%) — z przeliczeniem na PLN po kursach NBP.
 
+**Wersja online (GitHub Pages):** <https://karolkieglerski.github.io/pitownik/>
+
 Wszystko działa **wyłącznie w przeglądarce** — pliki nie opuszczają Twojego komputera.
 Jedyne zapytania sieciowe to pobranie kursów walut z publicznego API NBP.
 
@@ -32,7 +34,8 @@ Jedyne zapytania sieciowe to pobranie kursów walut z publicznego API NBP.
 
 Bez instalacji — wystarczy przeglądarka:
 
-1. Otwórz `web/index.html` (lokalnie lub przez GitHub Pages).
+1. Otwórz **<https://karolkieglerski.github.io/pitownik/>** (wersja online na
+   GitHub Pages) albo lokalnie `web/index.html`.
 2. Przeciągnij raport `.xlsx` z brokera na stronę (lub wybierz plik).
 3. Poczekaj na pobranie kursów NBP i gotowe.
 

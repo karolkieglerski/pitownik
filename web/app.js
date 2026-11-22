@@ -1319,3 +1319,167 @@ document.addEventListener('DOMContentLoaded', () => {
     fileInput.click();
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// Document popup (LICENSE / OPEN_SOURCE.md)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Render a Markdown subset (headings, emphasis, links, lists, code
+ * blocks and inline code) to HTML. Used by the document popup so that
+ * e.g. OPEN_SOURCE.md is displayed formatted, not as plain text.
+ */
+function renderMarkdown(md) {
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, text, href) => {
+      if (/^(https?:|mailto:|#)/i.test(href)) {
+        return `<a href="${href}" target="_blank" rel="noopener">${text}</a>`;
+      }
+      // Link wewnętrzny (np. LICENSE w OPEN_SOURCE.md) — otwórz w popupie.
+      return `<a href="#" data-doc="${esc(href)}">${text}</a>`;
+    });
+
+  const lines = String(md).replace(/\r\n/g, '\n').split('\n');
+  let html = '';
+  let para = [];   // bufor akapitu
+  let list = null; // 'ul' | 'ol'
+  let code = null; // bufor bloku kodu (null = nie jesteśmy w bloku)
+
+  const flushPara = () => {
+    if (para.length) {
+      html += `<p>${inline(para.join(' '))}</p>`;
+      para = [];
+    }
+  };
+  const closeList = () => {
+    if (list) {
+      html += `</${list}>`;
+      list = null;
+    }
+  };
+  const flushAll = () => { flushPara(); closeList(); };
+
+  for (const line of lines) {
+    if (code !== null) {
+      if (/^```/.test(line)) {
+        html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
+        code = null;
+      } else {
+        code.push(line);
+      }
+      continue;
+    }
+    if (/^```/.test(line)) {
+      flushAll();
+      code = [];
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flushAll();
+      const level = Math.min(heading[1].length + 2, 6); // # → h3 w popupie
+      html += `<h${level}>${inline(heading[2])}</h${level}>`;
+      continue;
+    }
+    const ul = line.match(/^\s*[-*]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) {
+      flushPara();
+      const kind = ul ? 'ul' : 'ol';
+      if (list !== kind) {
+        closeList();
+        html += `<${kind}>`;
+        list = kind;
+      }
+      html += `<li>${inline((ul || ol)[1])}</li>`;
+      continue;
+    }
+    if (!line.trim()) {
+      flushAll();
+      continue;
+    }
+    closeList();
+    para.push(line.trim());
+  }
+  if (code !== null) {
+    html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
+  }
+  flushAll();
+  return html;
+}
+
+/**
+ * Fetch a document's text. Tries the page's own directory first, then one
+ * level up — locally the app is served from /web/ while LICENSE and
+ * OPEN_SOURCE.md live in the repository root (on GitHub Pages both are
+ * copied to the site root, so the first path works).
+ */
+async function fetchDocText(path) {
+  for (const candidate of [path, '../' + path]) {
+    try {
+      const res = await fetch(candidate);
+      if (res.ok) return { text: await res.text(), url: candidate };
+    } catch (e) {
+      // Sieć niedostępna — spróbuj kolejnej ścieżki.
+    }
+  }
+  return null;
+}
+
+/** Open the document popup and render the given file inside it. */
+async function openDocModal(path, title) {
+  const modal = document.getElementById('docModal');
+  const body = document.getElementById('docModalBody');
+  document.getElementById('docModalTitle').textContent = title || path;
+  body.innerHTML = '<p class="doc-modal-loading">Wczytywanie…</p>';
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+
+  const doc = await fetchDocText(path);
+  if (!doc) {
+    body.innerHTML = `<p class="doc-modal-error">Nie udało się wczytać pliku ${esc(path)}.</p>`;
+    return;
+  }
+  // Markdown — sformatuj; czysty tekst (LICENSE) — zachowaj układ tekstu.
+  body.innerHTML = /\.md$/i.test(path)
+    ? renderMarkdown(doc.text)
+    : `<pre class="doc-plain">${esc(doc.text)}</pre>`;
+
+  const download = document.getElementById('docModalDownload');
+  download.href = doc.url;
+  download.setAttribute('download', path.split('/').pop());
+}
+
+/** Close the document popup. */
+function closeDocModal() {
+  document.getElementById('docModal').classList.add('hidden');
+  document.body.style.overflow = '';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  // Linki w stopce (i każde inne a[data-doc]) otwierają popup zamiast nawigować.
+  document.querySelectorAll('a[data-doc]').forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      openDocModal(link.dataset.doc, link.dataset.docTitle || link.textContent.trim());
+    });
+  });
+
+  document.getElementById('docModalClose').addEventListener('click', closeDocModal);
+  document.getElementById('docModalBackdrop').addEventListener('click', closeDocModal);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeDocModal();
+  });
+
+  // Linki wewnątrz popupu (np. LICENSE w OPEN_SOURCE.md) też otwierają popup.
+  document.getElementById('docModalBody').addEventListener('click', e => {
+    const link = e.target.closest('a[data-doc]');
+    if (link) {
+      e.preventDefault();
+      openDocModal(link.dataset.doc, link.textContent.trim());
+    }
+  });
+});

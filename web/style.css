@@ -587,6 +587,162 @@ footer {
 
 .footer-links a:hover { text-decoration: underline; }
 
+/* ─── Document modal (LICENSE / OPEN_SOURCE.md) ─────────────── */
+
+.doc-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+}
+
+.doc-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(3px);
+}
+
+.doc-modal-card {
+  position: relative;
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  width: min(720px, 100%);
+  max-height: min(82vh, 900px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: doc-modal-in 0.18s ease-out;
+}
+
+@keyframes doc-modal-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+
+.doc-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.1rem 1.4rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.doc-modal-header h2 {
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.doc-modal-close {
+  border: none;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  width: 2rem;
+  height: 2rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.doc-modal-close:hover { background: var(--border); color: var(--text); }
+
+.doc-modal-body {
+  padding: 1.25rem 1.4rem;
+  overflow-y: auto;
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
+
+.doc-modal-body h3 { font-size: 1.25rem; margin: 1.1rem 0 0.55rem; }
+.doc-modal-body h4 { font-size: 1.08rem; margin: 1rem 0 0.5rem; }
+.doc-modal-body h5,
+.doc-modal-body h6 { font-size: 0.98rem; margin: 0.9rem 0 0.45rem; }
+.doc-modal-body h3:first-child { margin-top: 0; }
+
+.doc-modal-body p { margin: 0 0 0.75rem; }
+
+.doc-modal-body ul,
+.doc-modal-body ol {
+  margin: 0 0 0.75rem;
+  padding-left: 1.35rem;
+}
+
+.doc-modal-body li { margin: 0.2rem 0; }
+
+.doc-modal-body a {
+  color: var(--primary-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.doc-modal-body code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: var(--surface-2);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  padding: 0.1em 0.35em;
+}
+
+.doc-modal-body pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  overflow-x: auto;
+  margin: 0 0 0.85rem;
+}
+
+.doc-modal-body pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+.doc-modal-body .doc-plain {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  color: var(--text);
+  margin: 0;
+}
+
+.doc-modal-loading,
+.doc-modal-error {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.doc-modal-error { color: var(--danger); }
+
+.doc-modal-footer {
+  padding: 0.85rem 1.4rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.doc-modal-download {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--primary-strong);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.85rem;
+  background: var(--surface-2);
+}
+
+.doc-modal-download:hover { background: var(--primary-soft); }
+
 /* ─── Utility ───────────────────────────────────────────────── */
 
 .hidden { display: none !important; }
@@ -611,4 +767,10 @@ a:focus-visible {
   .results-bar { flex-direction: column; align-items: flex-start; }
   .summary-subtable { max-width: 100%; }
   .tax-amount { font-size: 1.35rem !important; }
+  .doc-modal { padding: 0.6rem; }
+  .doc-modal-card { max-height: 88vh; }
+  .doc-modal-header, .doc-modal-body, .doc-modal-footer {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
 }
